@@ -7,7 +7,7 @@ This repository contains scripts used for rare variant identification and pathwa
 1. Alignment (BWA-MEM)
 2. BAM processing (samtools, GATK)
 3. Variant calling (HaplotypeCaller)
-4. Filtering (GATK VQSR, HardFiltering)
+4. Filtering (GATK VQSR, HardFiltering, REVEL, gnomAD)
 5. Annotation (VEP)
 
 ## Requirements
