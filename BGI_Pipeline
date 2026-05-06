@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# Check sample name
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <sampleName>"
+    exit 1
+fi
+
+# Sample Name
+sampleName=$1
+
+# Quality Control
+fastqc ${sampleName}_1.fq.gz ${sampleName}_2.fq.gz
+
+# Alignment
+bwa mem -t 4 /pvol/HG/hg38.fa ${sampleName}_1.fq.gz ${sampleName}_2.fq.gz \
+  | samtools view -Sb - \
+  | samtools sort -@ 4 -o ${sampleName}_sorted.bam
+samtools index ${sampleName}_sorted.bam
+
+# Mark Duplicates
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar MarkDuplicates I=${sampleName}_sorted.bam O=${sampleName}_dedup.bam M=${sampleName}.metrics
+samtools index ${sampleName}_dedup.bam
+
+# Add or Replace Read Groups
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar AddOrReplaceReadGroups \
+    I=${sampleName}_dedup.bam \
+    O=${sampleName}_sorted_with_RG.bam \
+    RGID=${sampleName}_001 \
+    RGLB=lib1 \
+    RGPL=illumina \
+    RGPU=unit1 \
+    RGSM=${sampleName}
+
+# Base Recalibration
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar BaseRecalibrator \
+    -I ${sampleName}_sorted_with_RG.bam \
+    -R /pvol/HG/hg38.fa \
+    -O ${sampleName}_data.table \
+    --known-sites /pvol/HG/00-Allref.vcf.gz
+
+# Apply Base Quality Score Recalibration (BQSR)
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar ApplyBQSR \
+    -R /pvol/HG/hg38.fa \
+    -I ${sampleName}_sorted_with_RG.bam \
+    --bqsr-recal-file ${sampleName}_data.table \
+    -O ${sampleName}_recal.bam
+
+# Variant Calling
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar HaplotypeCaller \
+    -R /pvol/HG/hg38.fa \
+    -I ${sampleName}_recal.bam \
+    -O ${sampleName}.g.vcf.gz \
+    -ERC GVCF \
+    --native-pair-hmm-threads 4
+
+# Variant Annotation
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar VariantAnnotator \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}.g.vcf.gz \
+    -O ${sampleName}_variants_annotated.vcf \
+    -A QualByDepth \
+    -A RMSMappingQuality \
+    -A MappingQualityRankSumTest \
+    -A ReadPosRankSumTest \
+    -A FisherStrand \
+    -A StrandOddsRatio
+
+# Genotype GVCFs
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar GenotypeGVCFs \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}_variants_annotated.vcf \
+    -O ${sampleName}_raw_variants.vcf
+
+# Select Variants (SNPs and INDELs)
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar SelectVariants \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}_raw_variants.vcf \
+    --select-type-to-include SNP \
+    -O ${sampleName}_raw_snps.vcf \
+
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar SelectVariants \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}_raw_variants.vcf \
+    --select-type-to-include INDEL \
+    -O ${sampleName}_raw_indels.vcf \
+
+# Run VariantRecalibrator for SNPs
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar VariantRecalibrator \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}_raw_snps.vcf \
+    --resource:hapmap,known=false,training=true,truth=true,prior=15.0 /pvol/HG/hapmap_3.3.hg38.vcf.gz \
+    --resource:omni,known=false,training=true,truth=true,prior=12.0 /pvol/HG/1000G_omni2.5.hg38.vcf.gz \
+    --resource:1000G,known=false,training=true,truth=false,prior=10.0 /pvol/HG/1000G_phase1.snps.high_confidence.hg38.vcf.gz \
+    --resource:dbsnp,known=true,training=false,truth=false,prior=2.0 /pvol/HG/00-Allref.vcf.gz \
+    -an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an SOR \
+    -mode SNP \
+    -O ${sampleName}output_recalibrated_snps.recal \
+    --tranches-file ${sampleName}output_recalibrated_snps.tranches \
+    --rscript-file ${sampleName}output_recalibrated_snps.plots.R
+
+# Apply VQSR for SNPs
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar ApplyVQSR \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}_raw_snps.vcf \
+    --recal-file ${sampleName}output_recalibrated_snps.recal \
+    --tranches-file ${sampleName}output_recalibrated_snps.tranches \
+    --output ${sampleName}_variants_recalibrated_snps.vcf \
+    --truth-sensitivity-filter-level 99.0 \
+    --mode SNP
+
+# Run VariantRecalibrator for INDELs
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar VariantRecalibrator \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}_raw_indels.vcf \
+    --resource:known_indels,known=true,training=true,truth=true,prior=12.0 /pvol/HG/Homo_sapiens_assembly38.known_indels.vcf.gz \
+    -an QD -an MQRankSum -an ReadPosRankSum -an FS -an SOR \
+    -mode INDEL \
+    -max-gaussians 4 \
+    -O ${sampleName}output_recalibrated_indels.recal \
+    --tranches-file ${sampleName}output_recalibrated_indels.tranches \
+    --rscript-file ${sampleName}output_recalibrated_indels.plots.R
+
+# Apply VQSR for INDELs
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar ApplyVQSR \
+    -R /pvol/HG/hg38.fa \
+    -V ${sampleName}_raw_indels.vcf \
+    --recal-file ${sampleName}output_recalibrated_indels.recal \
+    --tranches-file ${sampleName}output_recalibrated_indels.tranches \
+    --output ${sampleName}_variants_recalibrated_indels.vcf \
+    --truth-sensitivity-filter-level 99.0 \
+    --mode INDEL
+
+# Merge SNPs and INDELs
+bgzip ${sampleName}_variants_recalibrated_snps.vcf
+bgzip ${sampleName}_variants_recalibrated_indels.vcf
+
+tabix -p vcf ${sampleName}_variants_recalibrated_snps.vcf.gz
+tabix -p vcf ${sampleName}_variants_recalibrated_indels.vcf.gz
+
+java -jar /pvol/gatk-4.5.0.0/gatk-package-4.5.0.0-local.jar GatherVcfs \
+    -I ${sampleName}_variants_recalibrated_snps.vcf.gz \
+    -I ${sampleName}_variants_recalibrated_indels.vcf.gz \
+    -O ${sampleName}_variants_recalibrated_merged.vcf.gz
+
+# Index merged VCF
+tabix -p vcf /pvol/sample/${sampleName}/${sampleName}_variants_recalibrated_merged.vcf.gz
+
+# Annotate with VEP
+perl /pvol/ensembl-vep/vep \
+  -i /pvol/sample/${sampleName}/${sampleName}_variants_recalibrated_merged.vcf.gz \
+  --plugin dbNSFP,/pvol/vep_cache/dbNSFP/dbNSFP4.8a_grch38.gz,ALL \
+  --cache \
+  --dir_cache /pvol/vep_cache/ \
+  --dir_plugins ~/.vep/Plugins \
+  --sift s --polyphen s --hgvs --symbol --canonical \
+  --af_gnomade --af_gnomadg --pick \
+  -o /pvol/sample/${sampleName}/${sampleName}_variants_annotated_vep.vcf \
+  --fork 8
