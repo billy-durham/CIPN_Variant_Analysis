@@ -1,0 +1,238 @@
+#!/bin/bash
+
+# DP1) Per-base coverage across ALL targets (BQ≥0, MAPQ≥20 on your samtools build)
+samtools depth -a -q 0 -Q 20 \
+  -b bed/PANEL_TARGETS.harmonized.bed \
+  -f metadata/bgi.bam.list \
+  -@ N \
+  -o bed/bgi.counts.txt
+
+# DP2) Convert counts → callable BED (DP≥20 in ≥90% of samples), then merge
+awk '{
+  N=NF-2; c=0;
+  for(i=3;i<=NF;i++){ if($i>=20) c++ }
+  if(c >= 0.9*N) print $1"\t"$2-1"\t"$2
+}' bed/bgi.counts.txt \
+| sort -k1,1 -k2,2n \
+| bedtools merge -i - > bed/BGI.dp20.90pct.bed
+
+samtools depth -a -q 0 -Q 20 \
+  -b bed/PANEL_TARGETS.harmonized.bed \
+  -f metadata/ampliseq.bam.list \
+  -@ N \
+  -o bed/ampliseq.counts.txt
+
+awk '{
+  N=NF-2; c=0;
+  for(i=3;i<=NF;i++){ if($i>=20) c++ }
+  if(c >= 0.9*N) print $1"\t"$2-1"\t"$2
+}' bed/ampliseq.counts.txt \
+| sort -k1,1 -k2,2n \
+| bedtools merge -i - > bed/ampliseq.dp20.90pct.bed
+
+# 1) Make a full list of amp sample IDs
+bcftools query -l vcf_raw/ampliseq_joint/ampliseq_jointcalled_filtered.vcf.gz.vcf.gz > /pvol/project/aim2/metadata/amp.samples.txt
+
+nano amp.samples.txt
+## Create two .txt files (one containing all cases, and another containg controls)
+/metadata/amp_cases.txt
+/metadata/amp_controls.txt
+
+## Subset amp joint VCF into cases and controls
+### Cases
+bcftools view -S metadata/amp_cases.txt \
+  -Oz -o vcf_work/amp.cases.raw.vcf.gz \
+  vcf_raw/ampliseq_joint/ampliseq_jointcalled_filtered.vcf.gz
+tabix -p vcf vcf_work/amp.cases.raw.vcf.gz
+
+### Controls
+bcftools view -S metadata/amp_controls.txt \
+  -Oz -o vcf_work/amp.controls.raw.vcf.gz \
+  vcf_raw/ampliseq_joint/ampliseq_jointcalled_filtered.vcf.gz
+tabix -p vcf vcf_work/amp.controls.raw.vcf.gz
+
+
+
+
+
+## List files 
+### For AmpliSeq
+for vcf in vcf_raw/ampliseq_joint/*raw.vcf.gz; do
+  echo "=== $vcf ==="
+  bcftools view -h "$vcf" | grep -m1 "^#CHROM" | head -n1
+done
+
+for vcf in vcf_raw/ampliseq_joint/*raw.vcf.gz; do
+  echo "=== $vcf ==="
+  bcftools view -h "$vcf" | grep "##contig" | head -n3
+done
+
+### For BGI
+for vcf in vcf_raw/bgi_ind/*_variants_recalibrated_merged.vcf.gz; do
+  echo "=== $vcf ==="
+  bcftools view -h "$vcf" | grep -m1 "^#CHROM" | head -n1
+done
+
+for vcf in vcf_raw/bgi_ind/*_variants_recalibrated_merged.vcf.gz; do
+  echo "=== $vcf ==="
+  bcftools view -h "$vcf" | grep "##contig" | head -n3
+done
+
+# 1 ) Normalize samples
+##AmpliSeq Cases
+bcftools norm -m -any -f /pvol/HG/hg38.fa \
+  -Oz -o vcf_rework/amp.cases.norm.vcf.gz \
+  vcf_raw/ampliseq_joint/amp.cases.raw.vcf.gz
+tabix -p vcf vcf_rework/amp.cases.norm.vcf.gz
+
+##AmpliSeq Outlier
+bcftools norm -m -any -f /pvol/HG/hg38.fa \
+  -Oz -o vcf_rework/KEA426TAR.norm.vcf.gz \
+  vcf_raw/ampliseq_joint/KEA426TAR_filtered_combined.vcf.gz
+tabix -p vcf vcf_rework/KEA426TAR.norm.vcf.gz
+
+##AmpliSeq Controls
+bcftools norm -m -any -f /pvol/HG/hg38.fa \
+  -Oz -o vcf_rework/amp.ctrls.norm.vcf.gz \
+  vcf_raw/ampliseq_joint/amp.ctrls.raw.vcf.gz
+tabix -p vcf vcf_rework/amp.ctrls.norm.vcf.gz
+
+##BGI Individual
+for vcf in vcf_work/bgi_ind/*.vcf.gz; do
+  base=$(basename "$vcf" .vcf.gz)
+  bcftools norm -m -any -f /pvol/HG/hg38.fa \
+    -Oz -o vcf_rework/bgi/${base}.norm.vcf.gz "$vcf"
+  tabix -f -p vcf vcf_rework/bgi/${base}.norm.vcf.gz
+done
+
+# 2) Merge AmpliSeq Cases with Outlier
+bcftools merge -Oz -o vcf_rework/amp.cases.merged.vcf.gz \
+    vcf_rework/amp.cases.norm.vcf.gz vcf_rework/KEA426TAR.norm.vcf.gz
+tabix -p vcf vcf_rework/amp.cases.merged.vcf.gz
+
+## Merge BGI cases
+bcftools merge -l metadata/bgi_cases.list -Oz -o vcf_rework/bgi.cases.merged.vcf.gz
+tabix -p vcf vcf_rework/bgi.cases.merged.vcf.gz
+
+## Merge all BGI CONTROLS
+bcftools merge -l metadata/bgi_controls.list -Oz -o vcf_rework/bgi.ctrls.merged.vcf.gz
+tabix -p vcf vcf_rework/bgi.ctrls.merged.vcf.gz
+
+# 3) Merge cross-platform into mixed cases and controls
+## Merge AmpliSeq and BGI cases
+bcftools merge -Oz -o vcf_rework/cases.combined.vcf.gz \
+    vcf_rework/amp.cases.merged.vcf.gz vcf_rework/bgi.cases.merged.vcf.gz
+tabix -p vcf vcf_rework/cases.combined.vcf.gz
+
+## Merge AmpliSeq and BGI controls
+bcftools merge -Oz -o vcf_rework/controls.combined.vcf.gz \
+    vcf_rework/amp.ctrls.norm.vcf.gz vcf_rework/bgi.ctrls.merged.vcf.gz
+tabix -p vcf vcf_rework/controls.combined.vcf.gz
+
+# 4) Normalize Combined VCFs
+# Cases
+bcftools norm -m -any -f /pvol/HG/hg38.fa \
+  -Oz -o vcf_rework/cases.combined.norm.vcf.gz \
+  vcf_rework/cases.combined.vcf.gz
+tabix -p vcf vcf_rework/cases.combined.norm.vcf.gz
+
+# Controls
+bcftools norm -m -any -f /pvol/HG/hg38.fa \
+  -Oz -o vcf_rework/controls.combined.norm.vcf.gz \
+  vcf_rework/controls.combined.vcf.gz
+tabix -p vcf vcf_rework/controls.combined.norm.vcf.gz
+
+### Count how many variants are in each
+bcftools view -H vcf_rework/cases.combined.vcf.gz | wc -l
+bcftools view -H vcf_rework/controls.combined.vcf.gz | wc -l
+
+### Check to make sure build and contig names match in BED and VCF
+head -n3 bed/combined.dp20.90pct.bed
+bcftools view -h vcf_rework/cases.combined.norm.vcf.gz | grep -m3 "##contig"
+bcftools view -h vcf_rework/controls.combined.norm.vcf.gz | grep -m3 "##contig"
+
+
+# 5) Subset to callable regions (DP20;90%)
+## Cases
+bcftools view -R bed/combined.dp20.90pct.bed \
+  -Oz -o vcf_rework/cases.callable.vcf.gz \
+  vcf_rework/cases.combined.norm.vcf.gz
+tabix -p vcf vcf_rework/cases.callable.vcf.gz
+
+## Controls
+bcftools view -R bed/combined.dp20.90pct.bed \
+  -Oz -o vcf_rework/controls.callable.vcf.gz \
+  vcf_rework/controls.combined.norm.vcf.gz
+tabix -p vcf vcf_rework/controls.callable.vcf.gz
+
+### Count after Subset Filtering
+bcftools view -H vcf_rework/cases.callable.vcf.gz | wc -l
+bcftools view -H vcf_rework/controls.callable.vcf.gz | wc -l
+
+# 6) Run isec to keep only variants within controls
+bcftools isec -n=1 -w1 -p vcf_rework/isec_cases \
+  vcf_rework/cases.callable.vcf.gz \
+  vcf_rework/controls.callable.vcf.gz
+
+## BGzip and index
+bgzip -c vcf_rework/isec_cases/0000.vcf > vcf_rework/cases.only.vcf.gz
+tabix -f -p vcf vcf_work/cases.only.vcf.gz
+
+# 7) VEP Annotation
+perl /pvol/ensembl-vep/vep \
+  -i vcf_rework/cases.only.vcf.gz \
+  -o vep/cases.only.vep.vcf.gz \
+  --vcf --compress_output bgzip --force_overwrite \
+  --cache --offline --assembly GRCh38 \
+  --fasta /pvol/HG/hg38.fa \
+  --dir_cache /pvol/vep_cache/ \
+  --dir_plugins ~/.vep/Plugins \
+  --plugin dbNSFP,/pvol/vep_cache/dbNSFP/dbNSFP4.8a_grch38.gz,ALL,transcript_match=1 \
+  --sift s --polyphen s --hgvs --symbol --canonical --pick \
+  --af_gnomade --af_gnomadg \
+  --fork 8
+
+# 8) VEP Filter
+perl /pvol/ensembl-vep/filter_vep \
+  -i vep/cases.only.vep.vcf.gz \
+  -o vcf_work/cases.only.vep.filtered.vcf \
+  --force_overwrite --format vcf \
+  --filter "gnomAD_exomes_POPMAX_AF <= 0.01 or not gnomAD_exomes_POPMAX_AF" \
+  --filter "gnomAD_genomes_POPMAX_AF <= 0.01 or not gnomAD_genomes_POPMAX_AF" \
+  --filter "REVEL_score != '.' and REVEL_score >= 0.644"
+
+### Convert to tsv to view calls
+bcftools query -H \
+  -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/CSQ\t[%SAMPLE\t%GT\t%GQ\t%DP\t%AD\n]' \
+  vep/cases.only.vep.filtered.vcf.gz \
+  > results/cases.only.vep.filtered.table.tsv
+
+  
+bcftools query -H \
+  -f '%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n' \
+  vep/cases.only.vep.vcf.gz \
+  > results/cases.only.vep.GT.table.tsv
+
+# 9) Filter so only SNPs/SNVs remain
+bcftools view -v snps -Oz \
+  -o results/cases.only.vep.filtered.snvs.vcf.gz \
+  vep/cases.only.vep.filtered.vcf.gz
+tabix -p vcf results/cases.only.vep.filtered.snvs.vcf.gz
+
+# 10) Generate gene list and remove duplicates
+bcftools +split-vep results/cases.only.vep.filtered.snvs.vcf.gz \
+  -f '%SYMBOL\n' -d -a CSQ \
+| grep -v '^$' | sort -u > results/panther_input_genes.txt
+
+## Generated a list without duplicates removed to compare
+bcftools +split-vep results/cases.only.vep.filtered.snvs.vcf.gz \
+  -f '%SYMBOL\n' -d -a CSQ \
+| grep -v '^$' > results/panther_input_genes_with_duplicates.txt
+
+### Count gene amount with & without duplicates
+wc -l results/panther_input_genes_with_duplicates.txt
+wc -l results/panther_input_genes.txt
+
+### Count frequency rates for without duplicates
+sort results/panther_input_genes_with_duplicates.txt | uniq -c | sort -nr | head
+
