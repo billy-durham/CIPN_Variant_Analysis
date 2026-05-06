@@ -20,3 +20,4 @@ This repository contains scripts used for rare variant identification and pathwa
 ## Notes
 - No raw sequencing data is included due to privacy restrictions.
 - Two separate pipelines were designed to accommodate for BGI and IonTorrent AmpliSeq Data and are labeled accordingly.
+- Script for Overlap Analysis used combined data from first two pipelines. 
